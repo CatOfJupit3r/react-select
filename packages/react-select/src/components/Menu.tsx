@@ -587,6 +587,57 @@ interface ComputedPosition {
   rect: { left: number; width: number };
 }
 
+/**
+ * Small positional tolerance (in pixels) used to smooth out sub-pixel wiggle
+ * reported by floating-ui. Derived from viewport logs where values kept
+ * oscillating by <1px and triggering redundant updates.
+ */
+const POSITION_EPSILON = 0.5;
+/**
+ * Upper bound on how many position mutations we accept during a single
+ * observation window. Prevents the tight auto-update loop
+ */
+const MAX_POSITION_UPDATES_PER_WINDOW = 30;
+/** Length of the mutation observation window (in milliseconds). */
+const POSITION_UPDATE_WINDOW_MS = 20;
+
+/**
+ * Compares the current menu coordinates against the last committed values with
+ * a tiny tolerance so we ignore cosmetic floating-point jitter instead of
+ * rerendering endlessly.
+ *
+ * @param prev previous computed portal position, or null if never set
+ * @param next latest measurement from `getBoundingClientObj`
+ * @param epsilon override for the accepted positional tolerance
+ */
+const arePositionsApproximatelyEqual = (
+  prev: ComputedPosition | null,
+  next: ComputedPosition,
+) => {
+  if (!prev) return false;
+
+  const offsetMatches = Math.abs(prev.offset - next.offset) <= POSITION_EPSILON;
+  const leftMatches = Math.abs(prev.rect.left - next.rect.left) <= POSITION_EPSILON;
+  const widthMatches = Math.abs(prev.rect.width - next.rect.width) <= POSITION_EPSILON;
+
+  return offsetMatches && leftMatches && widthMatches;
+};
+
+/**
+ * Ensures the bounding box returned by the DOM actually represents a rendered
+ * menu. During the overflow loop we occasionally received zero-width rectangles
+ * while React tore down the menu, which would otherwise propagate NaNs through
+ * our layout math.
+ */
+const isMeaningfulRect = (rect: { width: number; height?: number }) => {
+  if (!rect) return false;
+  const { width, height } = rect;
+  if (!Number.isFinite(width)) return false;
+  if (typeof height === 'number' && !Number.isFinite(height)) return false;
+
+  return width > 0 && (typeof height !== 'number' || height > 0);
+};
+
 export const MenuPortal = <
   Option,
   IsMulti extends boolean,
@@ -617,28 +668,55 @@ export const MenuPortal = <
   );
   const [computedPosition, setComputedPosition] =
     useState<ComputedPosition | null>(null);
+  /**
+   * Rolling counter that throttles how often we accept new measurements.
+   * Without this, the auto-update callback would fire continuously while the
+   * target element toggled layout, leading to recursive state churn.
+   */
+  const positionUpdateGuardRef = useRef<{ windowStart: number; updates: number }>(
+    { windowStart: 0, updates: 0 }
+  );
 
   const updateComputedPosition = useCallback(() => {
     if (!controlElement) return;
 
     const rect = getBoundingClientObj(controlElement);
-    const scrollDistance = menuPosition === 'fixed' ? 0 : window.pageYOffset;
+    if (!isMeaningfulRect(rect)) return;
+
+    const globalObj =
+      typeof globalThis === 'object' && globalThis
+        ? (globalThis as { pageYOffset?: number })
+        : undefined;
+    const scrollDistance =
+      menuPosition === 'fixed'
+        ? 0
+        : Number.isFinite(globalObj?.pageYOffset || 0)
+          ? (globalObj?.pageYOffset as number)
+          : 0;
     const offset = rect[placement] + scrollDistance;
-    if (
-      offset !== computedPosition?.offset ||
-      rect.left !== computedPosition?.rect.left ||
-      rect.width !== computedPosition?.rect.width
-    ) {
-      setComputedPosition({ offset, rect });
+
+    const guard = positionUpdateGuardRef.current;
+    const now = Date.now();
+    if (now - guard.windowStart > POSITION_UPDATE_WINDOW_MS) {
+      guard.windowStart = now;
+      guard.updates = 0;
     }
-  }, [
-    controlElement,
-    menuPosition,
-    placement,
-    computedPosition?.offset,
-    computedPosition?.rect.left,
-    computedPosition?.rect.width,
-  ]);
+    guard.updates += 1;
+    if (guard.updates > MAX_POSITION_UPDATES_PER_WINDOW) {
+      return;
+    }
+
+    const nextPosition: ComputedPosition = {
+      offset,
+      rect: { left: rect.left, width: rect.width },
+    };
+    setComputedPosition((prev) => {
+      if (arePositionsApproximatelyEqual(prev, nextPosition)) {
+        return prev;
+      }
+      return nextPosition;
+    });
+  }, [controlElement, menuPosition, placement]);
 
   useLayoutEffect(() => {
     updateComputedPosition();
@@ -651,11 +729,14 @@ export const MenuPortal = <
     }
 
     if (controlElement && menuPortalRef.current) {
+      const hasResizeObserver =
+        typeof globalThis === 'object' &&
+        !!(globalThis as { ResizeObserver?: unknown }).ResizeObserver;
       cleanupRef.current = autoUpdate(
         controlElement,
         menuPortalRef.current,
         updateComputedPosition,
-        { elementResize: 'ResizeObserver' in window }
+        { elementResize: hasResizeObserver }
       );
     }
   }, [controlElement, updateComputedPosition]);
